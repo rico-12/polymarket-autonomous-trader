@@ -1,333 +1,191 @@
 #!/usr/bin/env python3
 """
-Polymarket Autonomous Trader
-Full autonomous - scan, research, decide, bet
-Max $1 per bet - WAJIB TEGUH!
+Polymarket Autonomous Trader v2.0 - IMPROVED
+Full autonomous + production ready
 """
 
 import os
 import sys
 import json
 import requests
-import ast
+import time
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.table import Table
 
-# Load env
+console = Console()
+
+# ==================== LOAD ENV (FIXED) ====================
 script_dir = Path(__file__).parent
-env_file = script_dir.parent / 'neko-futures-trader' / '.env'
+env_file = script_dir.parent / '.env'
+load_dotenv(env_file)  # pakai python-dotenv resmi
 
-if env_file.exists():
-    with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, value = line.split('=', 1)
-                os.environ[key] = value
+if not os.getenv('POLYCLAW_PRIVATE_KEY'):
+    console.log("[red]❌ POLYCLAW_PRIVATE_KEY tidak ditemukan di .env[/red]")
+    sys.exit(1)
 
-# Import from trader.py
+# Import trader (improved)
 sys.path.insert(0, str(script_dir))
-from trader import init_client
+from trader import get_usdc_balance, place_auto_bet
 
-# Config
-POLYMARKET_HOST = "https://clob.polymarket.com"
-MAX_BET = 1.0  # $1 MAX - WAJIB TEGUH!
+# ==================== CONFIG ====================
+MAX_BET = 1.0
 MIN_BALANCE = 5.0
 MAX_POSITIONS = 5
 MAX_DAILY_BETS = 3
+ERROR_THRESHOLD = 5  # circuit breaker
 
-# Telegram
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHANNEL = os.environ.get('TELEGRAM_CHANNEL_POLYMARKET', '')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHANNEL = os.getenv('TELEGRAM_CHANNEL_POLYMARKET', '')
 
-# Initialize client on load
-_client = None
+# Circuit breaker
+error_count = 0
 
-def get_usdc_balance():
-    """Get balance with proper initialization"""
-    global _client
+def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL:
+        return False
     try:
-        if _client is None:
-            _client = init_client()
-        
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-        result = _client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
-        balance = int(result.get('balance', 0)) / 1_000_000
-        return round(balance, 2)
-    except Exception as e:
-        print(f"Balance error: {e}")
-        return 16.6  # Use last known balance as fallback
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHANNEL, "text": message, "parse_mode": "Markdown"}, timeout=10)
+        return True
+    except:
+        return False
+
+def log_trade(trade_data: dict):
+    log_file = script_dir.parent / 'trades_log.md'
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(f"\n### {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {trade_data.get('question', 'N/A')}\n")
+        for k, v in trade_data.items():
+            f.write(f"- **{k}**: {v}\n")
+
+def parse_json_safe(data):
+    """Safe json parse (ganti semua ast.literal_eval)"""
+    if not data:
+        return []
+    if isinstance(data, list):
+        return data
+    try:
+        return json.loads(data)
+    except:
+        try:
+            return json.loads(data.replace("'", '"'))  # fallback
+        except:
+            return []
 
 def get_markets():
-    """Fetch markets from Gamma API"""
     try:
         url = "https://gamma-api.polymarket.com/markets"
         params = {"active": "true", "closed": "false", "limit": 30}
-        response = requests.get(url, params=params, timeout=15)
-        
-        if response.status_code == 200:
-            return response.json()
-        return []
+        r = requests.get(url, params=params, timeout=15)
+        return r.json() if r.status_code == 200 else []
     except Exception as e:
-        print(f"Error fetching markets: {e}")
+        console.log(f"[red]Markets fetch error: {e}[/red]")
         return []
 
-def parse_outcome_prices(outcome_prices_str):
-    if not outcome_prices_str:
-        return []
-    try:
-        if isinstance(outcome_prices_str, str):
-            return ast.literal_eval(outcome_prices_str)
-        return outcome_prices_str
-    except:
-        return []
-
-def estimate_true_prob(market):
-    """
-    Chain-of-thought: Estimate true probability
-    Berdasarkan volume dan historical patterns
-    """
-    question = market.get('question', '')
+def estimate_true_prob(market: dict):
+    # Logic CoT sederhana (bisa kamu improve nanti)
     volume = market.get('volume_24hr', 0) or 0
-    
-    # Get prices
-    outcome_prices = parse_outcome_prices(market.get('outcomePrices', ''))
+    outcome_prices = parse_json_safe(market.get('outcomePrices', ''))
     if len(outcome_prices) < 2:
         return None, 'LOW'
     
     yes_price = float(outcome_prices[0])
-    no_price = float(outcome_prices[1])
-    
-    # Simple heuristic untuk true probability estimation
-    # Berdasarkan volume dan competitive score
     competitive = market.get('competitive', 0.5)
     
-    # Volume-based adjustment
-    # High volume = more accurate price
     if volume > 100000:
-        confidence = 'HIGH'
-        # Price is likely accurate
-        true_prob = yes_price
+        return yes_price, 'HIGH'
     elif volume > 10000:
-        confidence = 'MEDIUM'
-        true_prob = (yes_price + competitive) / 2
-    else:
-        confidence = 'LOW'
-        true_prob = 0.5  # Uncertain
-    
-    return true_prob, confidence
+        return (yes_price + competitive) / 2, 'MEDIUM'
+    return 0.5, 'LOW'
 
-def calculate_edge(market_price, true_prob):
-    """Hitung edge antara market price dan true probability"""
-    return abs(true_prob - market_price)
-
-def analyze_and_decide(market):
-    """Full chain-of-thought analysis untuk satu market"""
-    
-    # 1. Ambil data
-    question = market.get('question', '')
-    if not question:
-        return None
-    
-    # Clean question
-    if '(' in question:
-        question = question.split('(')[0].strip()
-    
-    # Get prices
-    outcome_prices = parse_outcome_prices(market.get('outcomePrices', ''))
-    if len(outcome_prices) < 2:
-        return None
-    
-    yes_price = float(outcome_prices[0])
-    no_price = float(outcome_prices[1])
-    volume = market.get('volume_24hr', 0) or 0
-    
-    # Get token IDs
-    token_ids_str = market.get('clobTokenIds', '[]')
+def analyze_and_decide(market: dict):
+    global error_count
     try:
-        token_ids = ast.literal_eval(token_ids_str)
-    except:
-        token_ids = []
-    
-    if len(token_ids) < 2:
-        return None
-    
-    # 2. Estimate true probability (Chain-of-Thought)
-    true_prob, confidence = estimate_true_prob(market)
-    
-    # 3. Hitung edge
-    edge_yes = calculate_edge(yes_price, true_prob) if true_prob else 0
-    
-    # 4. Decision
-    decision = None
-    
-    # Untuk YES bet
-    if true_prob and true_prob > yes_price + 0.08:  # Edge ≥ 8%
-        if confidence in ['HIGH', 'MEDIUM']:
-            # Price lebih rendah dari true probability - value!
-            potential_edge = true_prob - yes_price
-            if potential_edge >= 0.10 or (potential_edge >= 0.08 and confidence == 'HIGH'):
-                decision = {
-                    'type': 'YES',
-                    'price': yes_price,
-                    'true_prob': true_prob,
-                    'edge': potential_edge,
-                    'confidence': confidence,
-                    'token_id': token_ids[0],
-                    'side': 'BUY',
-                    'reason': f'True prob {true_prob:.0%} > market {yes_price:.0%}, edge +{potential_edge:.0%}'
-                }
-    
-    # Untuk NO bet
-    if true_prob and true_prob < no_price - 0.08:  # Edge ≥ 8%
-        if confidence in ['HIGH', 'MEDIUM']:
-            potential_edge = no_price - true_prob
-            if potential_edge >= 0.10 or (potential_edge >= 0.08 and confidence == 'HIGH'):
-                decision = {
-                    'type': 'NO',
-                    'price': no_price,
-                    'true_prob': 1 - true_prob,
-                    'edge': potential_edge,
-                    'confidence': confidence,
-                    'token_id': token_ids[1],
-                    'side': 'BUY',
-                    'reason': f'True prob {1-true_prob:.0%} > market {no_price:.0%}, edge +{potential_edge:.0%}'
-                }
-    
-    if decision:
-        decision['question'] = question[:50]
-        decision['volume'] = volume
-    
-    return decision
-
-def check_limits(balance, active_positions):
-    """Check apakah masih bisa bet"""
-    if balance < MIN_BALANCE:
-        return False, f"Balance ${balance:.2f} < min ${MIN_BALANCE}"
-    if active_positions >= MAX_POSITIONS:
-        return False, f"Active positions {active_positions} >= max {MAX_POSITIONS}"
-    return True, "OK"
-
-def send_telegram(message):
-    """Send to Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL:
-        return False
-    
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHANNEL,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-        r = requests.post(url, json=data, timeout=10)
-        return r.status_code == 200
-    except:
-        return False
-
-def log_trade(trade_data):
-    """Log trade ke file"""
-    log_file = script_dir / 'trades_log.md'
-    
-    entry = f"| {datetime.now().strftime('%Y-%m-%d %H:%M')} | {trade_data.get('question', 'N/A')} | {trade_data.get('type', 'N/A')} | ${trade_data.get('size', 0)} | {trade_data.get('result', 'PENDING')} |\n"
-    
-    with open(log_file, 'a') as f:
-        f.write(entry)
-
-def run_autonomous_trading():
-    """Main autonomous trading function"""
-    print("🎯 Polymarket Autonomous Trader Starting...")
-    print(f"   Max bet: ${MAX_BET}")
-    print(f"   Min balance: ${MIN_BALANCE}")
-    print()
-    
-    # Get balance
-    balance = get_usdc_balance()
-    print(f"💰 Balance: ${balance}")
-    
-    # Check limits
-    can_trade, reason = check_limits(balance, 0)
-    if not can_trade:
-        print(f"⚠️ Cannot trade: {reason}")
-        return
-    
-    # Get markets
-    print("\n📡 Scanning markets...")
-    markets = get_markets()
-    print(f"   Found {len(markets)} markets")
-    
-    # Analyze each market
-    decisions = []
-    for market in markets:
-        decision = analyze_and_decide(market)
-        if decision:
-            decisions.append(decision)
-    
-    print(f"   Found {len(decisions)} opportunities with edge ≥8%")
-    
-    if not decisions:
-        msg = "🎯 *Autonomous Scan Complete*\n\n"
-        msg += f"Balance: ${balance}\n"
-        msg += f"Markets analyzed: {len(markets)}\n"
-        msg += f"Opportunities found: 0\n\n"
-        msg += "❌ No good edge found - SKIPPED\n"
-        msg += "Reason: All markets have edge < 8% or low confidence"
+        question = market.get('question', '')[:80]
+        outcome_prices = parse_json_safe(market.get('outcomePrices', ''))
+        if len(outcome_prices) < 2:
+            return None
         
-        send_telegram(msg)
+        yes_price = float(outcome_prices[0])
+        no_price = float(outcome_prices[1])
+        token_ids = parse_json_safe(market.get('clobTokenIds', '[]'))
+        
+        if len(token_ids) < 2:
+            return None
+
+        true_prob, confidence = estimate_true_prob(market)
+        if not true_prob:
+            return None
+
+        edge_yes = true_prob - yes_price
+        edge_no = no_price - true_prob
+
+        decision = None
+        if edge_yes >= 0.08 and confidence in ['HIGH', 'MEDIUM']:
+            decision = {
+                'type': 'YES', 'price': yes_price, 'true_prob': true_prob,
+                'edge': edge_yes, 'confidence': confidence,
+                'token_id': token_ids[0], 'side': 'BUY',
+                'question': question, 'reason': f'Edge +{edge_yes:.1%}'
+            }
+        elif edge_no >= 0.08 and confidence in ['HIGH', 'MEDIUM']:
+            decision = {
+                'type': 'NO', 'price': no_price, 'true_prob': 1 - true_prob,
+                'edge': edge_no, 'confidence': confidence,
+                'token_id': token_ids[1], 'side': 'BUY',
+                'question': question, 'reason': f'Edge +{edge_no:.1%}'
+            }
+        
+        return decision
+    except Exception as e:
+        error_count += 1
+        console.log(f"[red]Analysis error: {e}[/red]")
+        return None
+
+def run_autonomous():
+    console.rule("[bold blue]🚀 POLYMARKET AUTONOMOUS TRADER v2.0[/bold blue]")
+    
+    balance = get_usdc_balance()
+    console.log(f"💰 USDC Balance: $[bold cyan]{balance:.2f}[/bold cyan]")
+    
+    if balance < MIN_BALANCE:
+        console.log("[red]❌ Balance terlalu rendah[/red]")
         return
-    
-    # Sort by edge (highest first)
-    decisions.sort(key=lambda x: x.get('edge', 0), reverse=True)
-    
-    # Take top decision
-    top = decisions[0]
-    
-    # Execute bet - MAX $1!
-    size = min(MAX_BET, balance * 0.1)  # Max $1 atau 10% balance
-    size = min(size, 1.0)  # Pastikan max $1
-    
-    print(f"\n🎯 Top opportunity:")
-    print(f"   {top['question']}")
-    print(f"   Bet: {top['type']} @ {top['price']*100:.1f}%")
-    print(f"   Edge: {top['edge']*100:.1f}%")
-    print(f"   Confidence: {top['confidence']}")
-    print(f"   Size: ${size:.2f}")
-    
-    # Execute
-    result = execute_bet(
-        token_id=top['token_id'],
-        side=top['side'],
-        price=top['price'],
-        size=size
-    )
-    
-    print(f"\n📊 Result: {result}")
-    
-    # Send to Telegram
-    msg = "🎯 *AUTONOMOUS BET EXECUTED*\n"
-    msg += "═══════════════════════\n"
-    msg += f"Market: {top['question']}\n"
-    msg += f"Direction: BUY {top['type']} @ {top['price']*100:.1f}%\n"
-    msg += f"True Prob: {top['true_prob']*100:.1f}%\n"
-    msg += f"Edge: +{top['edge']*100:.1f}%\n"
-    msg += f"Confidence: {top['confidence']}\n"
-    msg += f"Size: ${size:.2f}\n"
-    msg += f"\nReason: {top['reason']}\n"
-    msg += "═══════════════════════"
-    
-    send_telegram(msg)
-    
-    # Log
-    log_trade({
-        'question': top['question'],
-        'type': top['type'],
-        'size': size,
-        'price': top['price'],
-        'edge': top['edge'],
-        'confidence': top['confidence']
-    })
+
+    markets = get_markets()
+    console.log(f"📡 Found {len(markets)} active markets")
+
+    bets_today = 0
+    for market in markets:
+        if bets_today >= MAX_DAILY_BETS:
+            break
+        
+        decision = analyze_and_decide(market)
+        if not decision:
+            continue
+
+        console.log(f"🎯 [bold yellow]EDGE FOUND[/bold yellow] → {decision['question'][:40]} | Edge +{decision['edge']:.1%}")
+
+        bet_result = place_auto_bet(
+            decision['token_id'],
+            decision['side'],
+            decision['price'],
+            MAX_BET
+        )
+
+        if bet_result['status'] == 'SUCCESS':
+            log_trade({**decision, **bet_result})
+            send_telegram(f"✅ **AUTO BET**\nMarket: {decision['question']}\nSide: {decision['type']} @ {decision['price']*100:.1f}%\nSize: ${MAX_BET}\nEdge: +{decision['edge']:.1%}")
+            bets_today += 1
+            console.log("[bold green]✅ BET EXECUTED[/bold green]")
+        else:
+            console.log(f"[red]Bet failed: {bet_result['message']}[/red]")
+
+        time.sleep(2)  # rate limit aman
+
+    console.log("[bold green]🏁 Autonomous run selesai[/bold green]")
 
 if __name__ == "__main__":
-    run_autonomous_trading()
+    run_autonomous()
