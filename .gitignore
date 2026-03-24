@@ -1,6 +1,12 @@
 *.pyc
 __pycache__/
 .env
+.env.*
 *.log
 node_modules/
+config/
+credentials/
+*.key
+*.pem
+.DS_Store
 

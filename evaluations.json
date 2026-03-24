@@ -1,0 +1,24 @@
+{
+  "evaluations": [
+    {
+      "timestamp": "2026-03-23T03:39:45.781684",
+      "performance": {
+        "total_positions": 0,
+        "closed_positions": 0,
+        "open_positions": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0,
+        "indicator_performance": {},
+        "recent_signals": [],
+        "recommendations": [
+          "\u26a0\ufe0f Win rate rendah - pertimbangkan score threshold lebih tinggi",
+          "   Saat ini: \u226550, pertimbangkan \u226560"
+        ]
+      },
+      "signals_analyzed": 0
+    }
+  ],
+  "improvements": [],
+  "last_run": "2026-03-23T03:39:45.781690"
+}
